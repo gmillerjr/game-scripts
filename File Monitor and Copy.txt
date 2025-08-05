@@ -1,0 +1,137 @@
+# ======================== CONFIGURATION ========================
+# Folder mappings: source => destination
+$folderMappings = @(
+    @{ Source = "D:\AMPDatastore\Instances\TheIsland01\ark-sa\2430930\ShooterGame\Saved\SavedArks\TheIsland_WP"; Destination = "C:\backups\ark\island\tempprofiles" },
+    @{ Source = "D:\AMPDatastore\Instances\Abberation01\ark-sa\2430930\ShooterGame\Saved\SavedArks\Aberration_WP"; Destination = "C:\backups\ark\aberration\tempprofiles" },
+    @{ Source = "D:\AMPDatastore\Instances\Extinction01\ark-sa\2430930\ShooterGame\Saved\SavedArks\Extinction_WP"; Destination = "C:\backups\ark\extinction\tempprofiles" },
+    @{ Source = "D:\AMPDatastore\Instances\Forglar01\ark-sa\2430930\ShooterGame\Saved\SavedArks\Forglar"; Destination = "C:\backups\ark\forglar\tempprofiles" },
+    @{ Source = "D:\AMPDatastore\Instances\Ragnarok01\ark-sa\2430930\ShooterGame\Saved\SavedArks\Ragnarok_WP"; Destination = "C:\backups\ark\rag\tempprofiles" }
+)
+
+# File types to watch for
+$fileExtensions = @(".arkprofile", ".arkprofiletemp")
+
+# Cleanup age threshold for .arkprofiletemp files (in days)
+$cleanupAgeDays = 7
+
+# How often to scan folders (in seconds)
+$pollIntervalSeconds = 60
+
+# Where to store state of already-seen files
+$seenFilesPath = "$PSScriptRoot\seenFiles.json"
+# ===============================================================
+
+
+# ======================= INITIAL SETUP =========================
+# Show current folder mappings
+$folderMappings | Format-Table Source, Destination
+
+# Ensure destination folders exist
+foreach ($map in $folderMappings) {
+    if (-not $map.Source -or -not $map.Destination) {
+        Write-Warning "Missing source or destination in a mapping: $($map | Out-String)"
+        continue
+    }
+
+    if (-not (Test-Path $map.Source)) {
+        Write-Warning "Source folder does not exist: $($map.Source)"
+    }
+
+    if (-not (Test-Path $map.Destination)) {
+        try {
+            New-Item -ItemType Directory -Path $map.Destination -Force | Out-Null
+        } catch {
+            Write-Warning "Failed to create destination folder: $($map.Destination)"
+        }
+    }
+}
+# ===============================================================
+
+
+# ================ LOAD SEEN FILES (STATE TRACKING) ==============
+$seenFiles = @{}
+
+if (Test-Path $seenFilesPath) {
+    $json = Get-Content $seenFilesPath -Raw
+
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        $seenFiles = ConvertFrom-Json -InputObject $json -AsHashtable
+    } else {
+        $tempFiles = ConvertFrom-Json -InputObject $json
+        foreach ($key in $tempFiles.PSObject.Properties.Name) {
+            $seenFiles[$key] = $tempFiles.$key
+        }
+    }
+}
+# ===============================================================
+
+
+# ======================= MAIN MONITOR LOOP ======================
+while ($true) {
+    foreach ($map in $folderMappings) {
+        $sourceFolder = $map.Source
+        $destFolder   = $map.Destination
+
+        if (-not (Test-Path $sourceFolder) -or -not (Test-Path $destFolder)) {
+            Write-Warning "Skipping: $sourceFolder or $destFolder is missing."
+            continue
+        }
+
+        # Get matching files in source folder
+        $files = Get-ChildItem -Path $sourceFolder -File | Where-Object {
+            $fileExtensions -contains $_.Extension.ToLower()
+        }
+
+        foreach ($file in $files) {
+            $fullPath = $file.FullName
+
+            # Only copy new files
+            if (-not $seenFiles.ContainsKey($fullPath)) {
+                $timestamp = Get-Date -Format "yyyy-MM-dd_HHmm"
+                $newFileName = "$timestamp-$($file.Name)"
+                $destinationPath = Join-Path $destFolder $newFileName
+
+                try {
+                    Copy-Item -Path $fullPath -Destination $destinationPath -Force
+
+                    # Log copy action
+                    $logEntry = "$($timestamp): Copied $($file.Name) to $destinationPath"
+                    Add-Content -Path (Join-Path $destFolder "copy_log.txt") -Value $logEntry
+                    Write-Host $logEntry
+
+                    # Track as seen
+                    $seenFiles[$fullPath] = $true
+                } catch {
+                    Write-Warning "Failed to copy '$($file.FullName)' to '$destinationPath': $_"
+                }
+            }
+        }
+
+        # =================== CLEANUP (ARCHIVE) ===================
+        $archiveFolder = Join-Path $destFolder "archive"
+        if (-not (Test-Path $archiveFolder)) {
+            New-Item -ItemType Directory -Path $archiveFolder | Out-Null
+        }
+
+        Get-ChildItem -Path $destFolder -Filter "*.arkprofiletemp" -File | Where-Object {
+            $_.LastWriteTime -lt (Get-Date).AddDays(-$cleanupAgeDays)
+        } | ForEach-Object {
+            $destArchivePath = Join-Path $archiveFolder $_.Name
+
+            try {
+                Move-Item -Path $_.FullName -Destination $destArchivePath -Force
+                Write-Host "Moved old .arkprofiletemp to archive: $($_.Name)"
+            } catch {
+                Write-Warning "Failed to archive '$($_.FullName)': $_"
+            }
+        }
+        # =========================================================
+    }
+
+    # Save current seen files list to disk
+    $seenFiles | ConvertTo-Json | Set-Content -Path $seenFilesPath
+
+    # Wait before next poll
+    Start-Sleep -Seconds $pollIntervalSeconds
+}
+# ===============================================================
